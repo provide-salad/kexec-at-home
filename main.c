@@ -16,6 +16,11 @@
  * <https://www.gnu.org/licenses/>.
  */
 
+#include <linux/sched.h>
+
+// <linux/sched.h> must appear before <asm/uaccess.h> to work on my machine
+// Don't ask me why, I have no idea.
+
 #include <asm/bootparam.h>
 #include <asm/e820/api.h>
 #include <asm/e820/types.h>
@@ -24,14 +29,14 @@
 #include <asm/set_memory.h>
 #include <asm/setup.h>
 #include <asm/uaccess.h>
+
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/mm.h>
 #include <linux/module.h>
-#include <linux/sched.h>
 #include <linux/slab.h>
-#include <linux/vmalloc.h>
 #include <linux/string.h>
+#include <linux/vmalloc.h>
 
 #ifdef __STDC_VERSION__
 #define BOOL_TYPE _Bool
@@ -59,7 +64,8 @@ extern const char kx_bzImage[];
 extern const char kx_trampoline[];
 extern const char kx_trampoline_end[];
 
-static const char cmdline[PAGE_SIZE] = "loglevel=7 console=tty0 earlyprintk=serial";
+static const char cmdline[PAGE_SIZE] =
+	"loglevel=7 console=tty0 earlyprintk=serial";
 static struct boot_params *g_bp;
 static int bp_err;
 static int bp_idx;
@@ -91,7 +97,7 @@ static void *kx_safe_addr(void) {
 	return ptr;
 }
 
-static int f_read_u64(const char* const name, u64* const out) {
+static int f_read_u64(const char *const name, u64 *const out) {
 	struct file *f;
 	char s[32];
 	loff_t i;
@@ -104,7 +110,7 @@ static int f_read_u64(const char* const name, u64* const out) {
 		return PTR_ERR(f);
 	}
 
-	r = kernel_read(f, s, sizeof(s)-1, &i);
+	r = kernel_read(f, s, sizeof(s) - 1, &i);
 	filp_close(f, NULL);
 
 	if (r < 0) {
@@ -116,18 +122,20 @@ static int f_read_u64(const char* const name, u64* const out) {
 	return kstrtoull(s, 0, out);
 }
 
-static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name, int name_size, loff_t offset, u64 ino, unsigned type) {
+static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name,
+							   int name_size, loff_t offset, u64 ino,
+							   unsigned type) {
 	struct file *f;
 	loff_t i;
 	ssize_t r;
 	enum e820_type t;
+	u64 start, end;
 	static char path[4096];
 
 	if (name[0] == '.') {
 		return 1;
 	}
 
-	u64 start, end;
 	snprintf(path, sizeof(path), "/sys/firmware/memmap/%s/start", name);
 	bp_err = f_read_u64(path, &start);
 	if (bp_err < 0) {
@@ -146,33 +154,33 @@ static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name, int na
 		bp_err = PTR_ERR(f);
 		return 0;
 	}
-	r = kernel_read(f, path, sizeof(path)-1, &i);
-	filp_close(f,NULL);
+	r = kernel_read(f, path, sizeof(path) - 1, &i);
+	filp_close(f, NULL);
 	if (r < 0) {
 		printk("(ERR) Failed to read file %s", path);
 		bp_err = r;
 		return 0;
 	}
-	path[r-1] = 0;
-	if (!strcmp("System RAM",path)) {
+	path[r - 1] = 0;
+	if (!strcmp("System RAM", path)) {
 		t = E820_TYPE_RAM;
-	} else if (!strcmp("ACPI Tables",path)) {
+	} else if (!strcmp("ACPI Tables", path)) {
 		t = E820_TYPE_ACPI;
-	} else if (!strcmp("Unusable memory",path)) {
+	} else if (!strcmp("Unusable memory", path)) {
 		t = E820_TYPE_RESERVED;
-	} else if (!strcmp("reserved",path)) {
+	} else if (!strcmp("reserved", path)) {
 		t = E820_TYPE_RESERVED;
-	} else if (!strcmp("Reserved",path)) {
+	} else if (!strcmp("Reserved", path)) {
 		t = E820_TYPE_RESERVED;
-	} else if (!strcmp("Unknown E820 type",path)) {
+	} else if (!strcmp("Unknown E820 type", path)) {
 		t = E820_TYPE_RESERVED;
-	} else if (!strcmp("ACPI Non-volatile Storage",path)) {
+	} else if (!strcmp("ACPI Non-volatile Storage", path)) {
 		t = E820_TYPE_NVS;
-	} else if (!strcmp("Uncached RAM",path)) {
+	} else if (!strcmp("Uncached RAM", path)) {
 		t = E820_TYPE_RAM;
-	} else if (!strcmp("Persistent memory (legacy)",path)) {
+	} else if (!strcmp("Persistent memory (legacy)", path)) {
 		t = E820_TYPE_PRAM;
-	} else if (!strcmp("Persistent memory",path)) {
+	} else if (!strcmp("Persistent memory", path)) {
 		t = E820_TYPE_PMEM;
 	} else {
 		t = E820_TYPE_RESERVED;
@@ -187,12 +195,13 @@ static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name, int na
 	return 1;
 }
 
-static int yoink_e820(struct boot_params* const bp) {
+static int yoink_e820(struct boot_params *const bp) {
 	struct file *f;
 	loff_t loff;
-	struct dir_context ctx;
-	
-	ctx.actor = &yoink_e820_cb;
+	struct dir_context ctx = {
+		&yoink_e820_cb,
+	};
+
 	loff = 0;
 	g_bp = bp;
 	bp_idx = 0;
@@ -203,7 +212,7 @@ static int yoink_e820(struct boot_params* const bp) {
 		return PTR_ERR(f);
 	}
 	f->f_op->iterate_shared(f, &ctx);
-	filp_close(f,NULL);
+	filp_close(f, NULL);
 	if (bp_err < 0) {
 		printk("(ERR) Failed to read file /sys/firmware/memmap");
 		return bp_err;
@@ -212,8 +221,8 @@ static int yoink_e820(struct boot_params* const bp) {
 	return 0;
 }
 
-__attribute__ ((unused,deprecated))
-static int get_boot_params_unsafe(struct boot_params *const bp) {
+__attribute__((unused, deprecated)) static int
+get_boot_params_unsafe(struct boot_params *const bp) {
 	struct file *f;
 	loff_t loff;
 	ssize_t rbytes;
@@ -503,4 +512,3 @@ static void kx_exit(void) {}
 
 module_init(kx_init);
 module_exit(kx_exit);
-
