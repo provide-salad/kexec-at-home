@@ -18,6 +18,7 @@
 
 #include <asm/bootparam.h>
 #include <asm/e820/api.h>
+#include <asm/e820/types.h>
 #include <asm/io.h>
 #include <asm/processor.h>
 #include <asm/set_memory.h>
@@ -30,6 +31,13 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/string.h>
+
+#ifdef __STDC_VERSION__
+#define BOOL_TYPE _Bool
+#else
+#define BOOL_TYPE int
+#endif
 
 #define PAGETAB_IDX(p, i) (((p) >> (i)) & 0x1FF)
 #define PML4_IDX(p) PAGETAB_IDX(p, 39)
@@ -51,7 +59,10 @@ extern const char kx_bzImage[];
 extern const char kx_trampoline[];
 extern const char kx_trampoline_end[];
 
-static const char cmdline[PAGE_SIZE] = "console=tty0 earlyprintk=serial";
+static const char cmdline[PAGE_SIZE] = "loglevel=7 console=tty0 earlyprintk=serial";
+static struct boot_params *g_bp;
+static int bp_err;
+static int bp_idx;
 
 MODULE_AUTHOR("?");
 MODULE_DESCRIPTION("?");
@@ -77,11 +88,132 @@ static void *kx_safe_addr(void) {
 		ptr = __va(page_to_phys(page));
 	} while ((uintptr_t)ptr < (MAP_PAGES << 21) ||
 			 virt_to_phys(ptr) < (MAP_PAGES << 21));
-	//	set_memory_rw((uintptr_t)ptr,1);
 	return ptr;
 }
 
-static int get_boot_params(struct boot_params *const bp) {
+static int f_read_u64(const char* const name, u64* const out) {
+	struct file *f;
+	char s[32];
+	loff_t i;
+	ssize_t r;
+
+	i = 0;
+	f = filp_open(name, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		printk("(ERR) Failed to open file %s", name);
+		return PTR_ERR(f);
+	}
+
+	r = kernel_read(f, s, sizeof(s)-1, &i);
+	filp_close(f, NULL);
+
+	if (r < 0) {
+		printk("(ERR) Failed to read file %s", name);
+		return r;
+	}
+
+	s[r] = 0;
+	return kstrtoull(s, 0, out);
+}
+
+static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name, int name_size, loff_t offset, u64 ino, unsigned type) {
+	struct file *f;
+	loff_t i;
+	ssize_t r;
+	enum e820_type t;
+	static char path[4096];
+
+	if (name[0] == '.') {
+		return 1;
+	}
+
+	u64 start, end;
+	snprintf(path, sizeof(path), "/sys/firmware/memmap/%s/start", name);
+	bp_err = f_read_u64(path, &start);
+	if (bp_err < 0) {
+		return 0;
+	}
+	snprintf(path, sizeof(path), "/sys/firmware/memmap/%s/end", name);
+	bp_err = f_read_u64(path, &end);
+	if (bp_err < 0) {
+		return 0;
+	}
+	snprintf(path, sizeof(path), "/sys/firmware/memmap/%s/type", name);
+	f = filp_open(path, O_RDONLY, 0);
+	i = 0;
+	if (IS_ERR(f)) {
+		printk("(ERR) Failed to open file %s", path);
+		bp_err = PTR_ERR(f);
+		return 0;
+	}
+	r = kernel_read(f, path, sizeof(path)-1, &i);
+	filp_close(f,NULL);
+	if (r < 0) {
+		printk("(ERR) Failed to read file %s", path);
+		bp_err = r;
+		return 0;
+	}
+	path[r-1] = 0;
+	if (!strcmp("System RAM",path)) {
+		t = E820_TYPE_RAM;
+	} else if (!strcmp("ACPI Tables",path)) {
+		t = E820_TYPE_ACPI;
+	} else if (!strcmp("Unusable memory",path)) {
+		t = E820_TYPE_RESERVED;
+	} else if (!strcmp("reserved",path)) {
+		t = E820_TYPE_RESERVED;
+	} else if (!strcmp("Reserved",path)) {
+		t = E820_TYPE_RESERVED;
+	} else if (!strcmp("Unknown E820 type",path)) {
+		t = E820_TYPE_RESERVED;
+	} else if (!strcmp("ACPI Non-volatile Storage",path)) {
+		t = E820_TYPE_NVS;
+	} else if (!strcmp("Uncached RAM",path)) {
+		t = E820_TYPE_RAM;
+	} else if (!strcmp("Persistent memory (legacy)",path)) {
+		t = E820_TYPE_PRAM;
+	} else if (!strcmp("Persistent memory",path)) {
+		t = E820_TYPE_PMEM;
+	} else {
+		t = E820_TYPE_RESERVED;
+	}
+
+	printk("e820: [ %16llx - %-16llx ] %s", start, end, path);
+
+	// TODO: Sort these?
+	g_bp->e820_table[bp_idx].addr = start;
+	g_bp->e820_table[bp_idx].size = end - start + 1;
+	g_bp->e820_table[bp_idx++].type = t;
+	return 1;
+}
+
+static int yoink_e820(struct boot_params* const bp) {
+	struct file *f;
+	loff_t loff;
+	struct dir_context ctx;
+	
+	ctx.actor = &yoink_e820_cb;
+	loff = 0;
+	g_bp = bp;
+	bp_idx = 0;
+	bp_err = 0;
+	f = filp_open("/sys/firmware/memmap", O_RDONLY | O_DIRECTORY, 0);
+	if (IS_ERR(f)) {
+		printk("(ERR) Failed to open file /sys/firmware/memmap");
+		return PTR_ERR(f);
+	}
+	f->f_op->iterate_shared(f, &ctx);
+	filp_close(f,NULL);
+	if (bp_err < 0) {
+		printk("(ERR) Failed to read file /sys/firmware/memmap");
+		return bp_err;
+	}
+	bp->e820_entries = bp_idx;
+	return 0;
+}
+
+__attribute__ ((unused,deprecated))
+static int get_boot_params_unsafe(struct boot_params *const bp) {
 	struct file *f;
 	loff_t loff;
 	ssize_t rbytes;
@@ -250,7 +382,7 @@ static void kx_jmp(void) {
 	// populate boot params
 	memset(bp, 0, sizeof(boot_params));
 	memcpy(cs, cmdline, PAGE_SIZE);
-	if (get_boot_params(bp)) {
+	if (yoink_e820(bp)) {
 		printk("!! WARNING !! AN ERROR HAS BEEN DETECTED");
 		return;
 	}
@@ -267,7 +399,8 @@ static void kx_jmp(void) {
 	bp->ext_ramdisk_image = 0x00000000;
 	bp->ext_ramdisk_size = 0x00000000;
 	bp->ext_cmd_line_ptr = 0x00000000;
-	//	bp->e820_entries = (uintptr_t)kx_num_e820;
+
+	print_zeropage(bp);
 
 	// physical address
 	trampoline_phys = virt_to_phys(trampoline);
@@ -370,3 +503,4 @@ static void kx_exit(void) {}
 
 module_init(kx_init);
 module_exit(kx_exit);
+

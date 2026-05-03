@@ -25,15 +25,21 @@ main.o
 
 kexec-at-home.ko
 kexec-at-home.o
+kexec-at-home.mod
 kexec-at-home.mod.c
 kexec-at-home.mod.o
+.module-common.o
 
 modules.order
 Module.symvers
 
 .kexec-at-home.ko.cmd
+.kexec-at-home.mod.cmd
 .kexec-at-home.mod.o.cmd
 .kexec-at-home.o.cmd
+..module-common.o.cmd
+.modules.order.cmd
+.Module.symvers.cmd
 .main.o.cmd
 
 .tmp_versions
