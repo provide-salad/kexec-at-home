@@ -27,13 +27,13 @@
 	hlt
 	jmp .
 .endm
-
 	endbr64
 
 	leal .Lgdt64(%rip),%esi
 	movl $0x00003000,%edi
 	movl $.Lgdt64_len,%ecx
 	movl %edi,%ebx
+	cld
 	rep movsq
 
 	subq $0x0A,%rsp
@@ -115,12 +115,12 @@
 	movl $0x00080000,%edi
 	movl $0x00200000,%esi
 	movl $(kx_bzImage-kx_blob)>>2,%ecx
+	cld
 	rep movsl
 	pushl $1f-kx_blob+0x80000
 	retl
 
 1:
-
 	movzbl 0x002001F1+kx_bzImage-kx_blob,%eax /* setup_sects */
 	shll $0x09,%eax
 
@@ -131,6 +131,7 @@
 	addl %eax,%esi
 	shrl $0x02,%eax
 	subl %eax,%ecx
+	cld
 	rep movsl
 
 	/* CRASH FIX */
@@ -164,13 +165,17 @@
 	movl $0,0xFEE00390
 	movl $0,0xFEE003E0
 
+	/* no idea what this does but purgatory does it so it must be good */
+	xorl %eax,%eax
+	movl %eax,%cr4
+
 	/* TODO: stop device interrupt sources */
 
-	/* drain interrupt controller state */
-	sti
-	nop
-	nop
-	cli
+	/* TODO: drain interrupt controller state */
+/*	sti */
+/*	nop */
+/*	nop */
+/*	cli */
 
 	/* --- */
 

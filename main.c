@@ -25,23 +25,48 @@
 #include <asm/e820/api.h>
 #include <asm/e820/types.h>
 #include <asm/io.h>
+#include <asm/msr.h>
 #include <asm/processor.h>
 #include <asm/set_memory.h>
 #include <asm/setup.h>
 #include <asm/uaccess.h>
 
+#include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/stop_machine.h>
 #include <linux/string.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
+
+#define MSR_IA32_PERF_GLOBAL_CTRL 0x38F
+#define MSR_IA32_PERF_GLOBAL_STATUS 0x38E
+#define MSR_IA32_PERF_GLOBAL_OVF_CTRL 0x390
+#define MSR_IA32_FIXED_CTR_CTRL 0x38D
+
+#define MSR_IA32_FIXED_CTR0 0x309
+#define MSR_IA32_FIXED_CTR1 0x30A
+#define MSR_IA32_FIXED_CTR2 0x30B
+
+#define MSR_IA32_PERFEVTSEL0 0x186
 
 #ifdef __STDC_VERSION__
 #define BOOL_TYPE _Bool
 #else
 #define BOOL_TYPE int
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+#define DIR_CONTINUE 0
+#define DIR_BREAK 1
+#else
+#define DIR_CONTINUE 1
+#define DIR_BREAK 0
 #endif
 
 #define PAGETAB_IDX(p, i) (((p) >> (i)) & 0x1FF)
@@ -58,14 +83,28 @@
 
 #define MAP_PAGES 64
 
+#define WRITE_MSR(name, value)                                                 \
+	wrmsr_safe((name), (u64)(value) & 0xFFFFFFFFULL, (u64)(value) >> 32)
+
+static cpumask_t kx_cpus;
+
+struct kx_data {
+	void (*trampoline)(phys_addr_t, size_t);
+	phys_addr_t pml4;
+};
+
+struct kx_data kx_data;
+static int kx_jump(void *);
+static void kx_kill_cpu(void *);
+static void kx_fix_pmu_state(void);
+
 extern const char kx_blob[];
 extern const char kx_blob_end[];
 extern const char kx_bzImage[];
 extern const char kx_trampoline[];
 extern const char kx_trampoline_end[];
 
-static const char cmdline[PAGE_SIZE] =
-	"loglevel=7 console=tty0 earlyprintk=serial";
+static const char cmdline[PAGE_SIZE] = "";
 static struct boot_params *g_bp;
 static int bp_err;
 static int bp_idx;
@@ -132,19 +171,23 @@ static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name,
 	u64 start, end;
 	static char path[4096];
 
+	printk("memmap file: %s", name);
+
 	if (name[0] == '.') {
-		return 1;
+		return DIR_CONTINUE;
 	}
+
+	printk("did we get here?");
 
 	snprintf(path, sizeof(path), "/sys/firmware/memmap/%s/start", name);
 	bp_err = f_read_u64(path, &start);
 	if (bp_err < 0) {
-		return 0;
+		return DIR_BREAK;
 	}
 	snprintf(path, sizeof(path), "/sys/firmware/memmap/%s/end", name);
 	bp_err = f_read_u64(path, &end);
 	if (bp_err < 0) {
-		return 0;
+		return DIR_BREAK;
 	}
 	snprintf(path, sizeof(path), "/sys/firmware/memmap/%s/type", name);
 	f = filp_open(path, O_RDONLY, 0);
@@ -152,14 +195,14 @@ static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name,
 	if (IS_ERR(f)) {
 		printk("(ERR) Failed to open file %s", path);
 		bp_err = PTR_ERR(f);
-		return 0;
+		return DIR_BREAK;
 	}
 	r = kernel_read(f, path, sizeof(path) - 1, &i);
 	filp_close(f, NULL);
 	if (r < 0) {
 		printk("(ERR) Failed to read file %s", path);
 		bp_err = r;
-		return 0;
+		return DIR_BREAK;
 	}
 	path[r - 1] = 0;
 	if (!strcmp("System RAM", path)) {
@@ -192,7 +235,7 @@ static BOOL_TYPE yoink_e820_cb(struct dir_context *ctx, const char *name,
 	g_bp->e820_table[bp_idx].addr = start;
 	g_bp->e820_table[bp_idx].size = end - start + 1;
 	g_bp->e820_table[bp_idx++].type = t;
-	return 1;
+	return DIR_CONTINUE;
 }
 
 static int yoink_e820(struct boot_params *const bp) {
@@ -201,6 +244,8 @@ static int yoink_e820(struct boot_params *const bp) {
 	struct dir_context ctx = {
 		&yoink_e820_cb,
 	};
+
+	printk("Grabbing e820");
 
 	loff = 0;
 	g_bp = bp;
@@ -361,9 +406,23 @@ print_zeropage(struct boot_params *const bp) {
 	}
 }
 
-static void kx_jmp(void) {
+// blindly copied from ChatGPT, no idea what this does
+__attribute__((unused)) static int kx_dev_poweroff(struct device *const dev,
+												   void *data) {
+	pm_runtime_get_sync(dev);
+
+	if (dev->driver && dev->driver->shutdown) {
+		dev->driver->shutdown(dev);
+	}
+
+	pm_runtime_put_sync(dev);
+	return 0;
+}
+
+static void kx_setup(void) {
 	phys_addr_t trampoline_phys, pml4_phys, pdpt_phys, pd_phys;
 	void (*trampoline)(phys_addr_t, size_t);
+	int perhaps_reboot_cpu;
 	uint64_t *pml4, *pdpt, *pdpt2, *pd, *pd2, *pt, *pt2, *pt3;
 	struct boot_params *bp;
 	void *page;
@@ -408,8 +467,6 @@ static void kx_jmp(void) {
 	bp->ext_ramdisk_image = 0x00000000;
 	bp->ext_ramdisk_size = 0x00000000;
 	bp->ext_cmd_line_ptr = 0x00000000;
-
-	print_zeropage(bp);
 
 	// physical address
 	trampoline_phys = virt_to_phys(trampoline);
@@ -486,25 +543,185 @@ static void kx_jmp(void) {
 	set_memory_x((uintptr_t)trampoline, 1);
 	// TODO: flush_tlb_kernel_range ?
 
+	printk("----------------");
 	// Enable this if you are suspicious of your boot_params
 	//	print_zeropage(bp);
 	//	return;
 
-	// "i am become kexec, destroyer of kernels." --provide salad
+	//	for_each_possible_cpu(cpu) {
+	//		per_cpu(kx_cpu_is_complete, cpu) = 1;
+	//	}
+	cpumask_copy(&kx_cpus, cpu_online_mask);
+	kx_data.trampoline = trampoline;
+	kx_data.pml4 = pml4_phys;
+	smp_mb(); // make sure all CPUs in `cpus` get the correct data
+
+	perhaps_reboot_cpu = cpumask_first(cpu_online_mask);
+	printk("CPU: %d\n", smp_processor_id());
+	//	set_cpus_allowed_ptr(current, cpumask_of(perhaps_reboot_cpu));
+	printk("CPU: %d\n", smp_processor_id());
+	stop_machine(kx_jump, NULL, cpumask_of(perhaps_reboot_cpu));
+	//	stop_machine(kx_jump, NULL, NULL);
+	return;
+}
+
+__attribute__((unused)) static void kx_kill_cpu(void *const _) {
+	(void)_;
+
 	preempt_disable();
-	//	hw_breakpoint_disable();
-	//	cet_disable();
 	local_irq_disable();
+	kx_fix_pmu_state();
+
+	while (1) {
+		cpu_relax();
+	}
+}
+
+__attribute__((unused)) static void kx_fix_pmu_state(void) {
+	int i;
+
+	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) {
+
+		WRITE_MSR(MSR_IA32_FIXED_CTR_CTRL, 0x0);
+		WRITE_MSR(MSR_IA32_DEBUGCTLMSR, 0x0);
+		WRITE_MSR(MSR_IA32_PERF_GLOBAL_OVF_CTRL, 0xC00000070000000FULL);
+		WRITE_MSR(MSR_IA32_PERF_GLOBAL_CTRL, 0x0);
+		//	WRITE_MSR(MSR_IA32_PERF_GLOBAL_STATUS,0x0); // this one is read-only
+		//so don't do that !
+		WRITE_MSR(MSR_IA32_FIXED_CTR0, 0x0);
+		WRITE_MSR(MSR_IA32_FIXED_CTR1, 0x0);
+		WRITE_MSR(MSR_IA32_FIXED_CTR2, 0x0);
+
+		for (i = 0; i < 4; ++i) {
+			WRITE_MSR(MSR_IA32_PERFEVTSEL0 + i, 0);
+			WRITE_MSR(MSR_IA32_PMC0 + i, 0);
+		}
+	}
+}
+
+// "i am become kexec, destroyer of kernels." --provide salad
+static int kx_jump(void *_) {
+	struct pci_dev *dev = NULL;
+	u16 _16;
+	cpumask_t cpus;
+	int i;
+	(void)_;
+
+	system_state = SYSTEM_RESTART;
+	local_irq_disable();
+	preempt_disable();
+
+	// What real kexec does:
+	// kernel_restart_prepare(NULL);
+	//  -> blocking_notifier_call_chain(&reboot_notifier_list, SYS_RESTART,
+	//  NULL);
+	//	(reboot_notifier_list is not exported)
+	//  -> system_state = SYSTEM_RESTART;
+	//  -> usermodehelper_disable();
+	//	-> down_write(&umhelper_sem);
+	//	    (umhelper_sem is not exported)
+	//	-> usermodehelper_disabled = UMH_DISABLE;
+	//	    (usermodehelper_disabled is not exported)
+	//	-> up_write(&umhelper_sem);
+	//	    (umhelper_sem is not exported)
+	//	->
+	//wait_event_timeout(running_helpers_waitq,atomic_read(&running_helpers),RUNNING_HELPERS_TIMEOUT);
+	//	    (running_helpers_waitq is not exported)
+	//	    (running_helpers is not exported)
+	//  -> device_shutdown();
+	//	(not exported)
+	// migrate_to_reboot_cpu();
+	//  -> set_cpus_allowed_ptr(current, cpumask_of(reboot_cpu));
+	//	(reboot_cpu is not exported)
+	// cpu_hotplug_enable();
+	// machine_shutdown();
+	//  -> clear_IO_APIC();
+	//	-> clear_IO_APIC_pin(...);
+	//	    -> native_io_apic_read(...);
+	//		-> io_apic_base();
+	//		    -> __fix_to_virt(...);
+	//		    -> mpc_ioapic_addr(...);
+	//			-> ioapics[ioapic_idx].mp_config.apicaddr;
+	//			    -> (ioapics is not exported)
+	//		-> writel(...);
+	//		-> readl(...);
+	//	    -> native_io_apic_write(...);
+	//		-> io_apic_base();
+	//		-> writel(...);
+	//	    -> __eoi_ioapic_pin(...);
+	//		-> mpc_ioapic_ver(...);
+	//		    -> ioapics[...].mp_config.apicver;
+	//			-> (ioapics is not exported)
+	//		-> io_apic_eoi(...);
+	//		    -> io_apic_base(...);
+	//		    -> writel(...);
+	//		-> native_io_apic_read(...);
+	//		-> native_io_apic_read(...);
+	//	    -> ioapic_mask_entry(...);
+	//		-> native_io_apic_write(...);
+	//  -> local_irq_disable();
+	//  -> stop_other_cpus();
+	//  -> lapic_shutdown();
+	//  -> restore_irq_boot_mode();
+	//  -> hpet_disable();
+	// machine_kexec();
+
+	cpumask_copy(&cpus, cpu_online_mask);
+	cpumask_clear_cpu(smp_processor_id(), &cpus);
+	on_each_cpu_mask(&cpus, kx_kill_cpu, NULL, 0);
+
+	kx_fix_pmu_state();
+
+	for (i = 0; i < 0x1000000; ++i) {
+		cpu_relax();
+	}
+
+	//	outb(0xFF,0x21);
+	//	outb(0xFF,0xA1);
+
+	//	hw_breakpoint_disable(); // not exported :c
+	//	cet_disable(); // not exported :c
+	// Don't worry, a second kexec will clean up the mess I made, hopefully,
+	// perhaps.
 	smp_send_stop();
+
+	//	bus_for_each_dev(&pci_bus_type, NULL, NULL, kx_dev_poweroff);
 	wmb();
 	kx_write_cr4(kx_read_cr4() & ~(X86_CR4_SMEP | X86_CR4_SMAP));
+	// TODO: pci_stop_and_remove_bus_device ?
+	// TODO: pci_set_power_state ?
+
+	//	apic->send_IPI_mask(cpumask, APIC_DM_INIT);
+
+	(void)dev;
+	(void)_16;
+	for_each_pci_dev(dev) {
+		if (!pci_is_enabled(dev)) {
+			continue;
+		}
+
+		disable_irq(dev->irq);
+		(void)pci_read_config_word(dev, PCI_COMMAND, &_16);
+		pci_clear_master(dev);
+		(void)pci_read_config_word(dev, PCI_COMMAND, &_16);
+	}
+
+	smp_mb();
+
+	stop_other_cpus(); // If the other CPU are still alive, kill them now.
 
 	// 💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀💀
-	trampoline(pml4_phys, BLOB_SIZE(kx_blob) >> 3);
+	kx_data.trampoline(kx_data.pml4, BLOB_SIZE(kx_blob) >> 3);
+
+	// should not every reach here, but if it does...
+	while (1) {
+		halt();
+	}
+	__builtin_unreachable();
 }
 
 static int kx_init(void) {
-	kx_jmp();
+	kx_setup();
 	return 0;
 }
 

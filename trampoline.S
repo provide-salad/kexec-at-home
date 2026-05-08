@@ -46,6 +46,7 @@ kx_trampoline:
 	movq %rsp,%rdi
 	xorl %eax,%eax
 	movl $0x00002000,%ecx
+	cld
 	rep stosq
 
 	xorl %ecx,%ecx
@@ -78,12 +79,14 @@ kx_trampoline:
 	movl $0x08200000,%esi
 	movl %edi,%ebx
 	movl %edx,%ecx
+	cld
 	rep movsq
 
 	/* copy boot_params and cmdline */
 	movl $0x00001000,%edi
 	movl $0x08000000,%esi
 	movl $0x00000400,%ecx
+	cld
 	rep movsq
 
 	/* LAUNCH THE BOOT-UNLOADER! */
